@@ -42,7 +42,7 @@ MIN_EPSILON = 2.0            # 下限不能太小：斜放矩形在角上会多�
 MAX_EPSILON = 4.0
 MIN_CONTOUR_POINTS = 8
 MERGE_DISTANCE = 8.0         # 相邻顶点近于此距离就合并成一个（栅格化会把一个角裂成两点）
-COMPENSATE_PX = 3.5          # 轮廓沿质心方向外扩的像素数，补偿阈值造成的内缩
+COMPENSATE_PX = 4.0     # 轮廓沿质心方向外扩的像素数，补偿阈值造成的内缩
 
 # ---- 显示 ----
 PIECE_COLORS = [
