@@ -92,6 +92,34 @@ def merge_close_vertices(points, min_distance):
     return merged
 
 
+def merge_short_edges(points, min_length):
+    """反复合并最短边，直到每条边都不短于 min_length（用题目约束收拾假顶点）。
+
+    题目规定现场碎片每条边不小于 2cm；明显短于它的边基本都是顶点提歪产生的假边，
+    按物理尺寸合并比调几何简化阈值稳得多。
+    """
+    merged = list(points)
+    while len(merged) > 3:
+        count = len(merged)
+        shortest, index = None, 0
+        for i in range(count):
+            x1, y1 = merged[i]
+            x2, y2 = merged[(i + 1) % count]
+            length = math.hypot(x2 - x1, y2 - y1)
+            if shortest is None or length < shortest:
+                shortest, index = length, i
+        if shortest >= min_length:
+            break
+        first = merged[index]
+        second = merged[(index + 1) % count]
+        middle = ((first[0] + second[0]) / 2.0, (first[1] + second[1]) / 2.0)
+        if index + 1 < count:
+            merged = merged[:index] + [middle] + merged[index + 2:]
+        else:
+            merged = [middle] + merged[1:count - 1]
+    return merged
+
+
 def convex_hull(points):
     """凸包（Andrew 单调链）：碎片是矩形直线切割得到的，一定是凸多边形，
     凸包能一次抹掉图案缺口与边界锯齿。"""

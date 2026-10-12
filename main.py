@@ -1,16 +1,11 @@
 # main.py - MaixCAM Pro 视觉端主程序（唯一入口）
 #
 # MaixVision 只能"运行完整项目"，所以各流程都收在这里，用 RUN_MODE 切换：
-#   "a4_calib" - A4 四角标定：检出纸张四角，算出 像素<->毫米 单应矩阵，
-#                并画一条水平、一条垂直的 100mm 参考线，用尺子量一下即可核对标定
-#   "a4_lock"  - A4 区域锁定：开机连续多帧确认纸张位置后锁定绿框，作为识别 ROI
-# 运行方式：MaixVision 打开本工程文件夹 -> 运行完整项目。
-#
-# 依赖：vision_geo.py（纯几何工具，不依赖 maix）；曝光标定见 calib_exposure.py。
+#   "a4_calib" - A4 四角标定：检出四角算 像素<->毫米 单应矩阵，并画 100mm 参考线核对
+#   "pieces"   - 碎片识别：用四角标定把碎片顶点换算成毫米，打印每片位姿
+# 运行：MaixVision 打开本工程文件夹 -> 运行完整项目。
+# 依赖：vision_geo.py（纯几何）、vision_pieces.py（碎片识别）；曝光标定见 calib_exposure.py。
 # 硬件假设：MaixCAM / MaixCAM Pro 本体；未接下位机时保持 USE_UART = False。
-#
-# API 依据（Sipeed 官方 MaixPy 文档）：cam.exposure(value) 单位微秒，设置后进入手动曝光；
-# cam.gain(value) 的增益仅在手动曝光模式下生效；cam.set_wb_gain() 调用即禁用自动白平衡。
 
 import math
 import time
@@ -18,9 +13,10 @@ import time
 from maix import app, camera, display, image, pinmap, uart, err
 
 import vision_geo
+import vision_pieces
 
 # ---- 运行模式 ----
-RUN_MODE = "a4_calib"            # "a4_calib" | "a4_lock"
+RUN_MODE = "pieces"              # "a4_calib" | "pieces"
 
 # ---- 串口（对接下位机）----
 USE_UART = False                 # 未接 STM32 时保持 False；接上后改 True
@@ -39,7 +35,7 @@ LOCK_WHITE_BALANCE = True
 WB_GAIN_FALLBACK = [0.134, 0.0625, 0.0625, 0.1239]   # 官方给出的 MaixCAM 初始白平衡增益
 
 # ---- 工作分辨率 ----
-WORK_SCALE = 2                   # 识别与标定都在 1/2 分辨率上做，坐标最后乘回来
+WORK_SCALE = 2                   # 标定与识别都在 1/2 分辨率上做，坐标最后乘回来
 WORK_W = CAM_W // WORK_SCALE
 WORK_H = CAM_H // WORK_SCALE
 
@@ -52,29 +48,31 @@ A4_MIN_AREA_RATIO = 0.15         # A4 至少要占画面这么大比例，用来
 A4_CALIB_MIN_PIXELS = 2000       # 工作分辨率下的最小像素数（兜底）
 A4_BBOX_PAD = 3
 A4_CLOSE_SIZE = 3                # 对 A4 掩膜做闭运算，补上被阴影吃掉的边缘断口
-QUAD_SMOOTH_ALPHA = 0.25         # 四角时序平滑系数：越小越稳、越大跟得越快
-QUAD_TOL_PX = 12                 # 与锁定四角的平均偏差超过它就认为纸张在动（工作分辨率像素）
-QUAD_SWITCH_FRAMES = 4           # 连续多少次重算都偏离才切换锁定四角（配合 0.5s 间隔约 2 秒）
 EPSILON_RATIO = 0.01             # 简化阈值 = 轮廓周长 × 该比例
 MIN_EPSILON = 2.0
 MAX_EPSILON = 4.0
 MERGE_DISTANCE = 8.0             # 相邻顶点近于此距离就合并成一个
 REFERENCE_MM = 100.0             # 参考线长度（毫米），用尺子核对标定
+QUAD_SMOOTH_ALPHA = 0.25         # 四角时序平滑系数：越小越稳、越大跟得越快
+QUAD_TOL_PX = 12                 # 与锁定四角的平均偏差超过它就认为纸张在动
+QUAD_SWITCH_FRAMES = 4           # 连续多少次重算都偏离才切换锁定四角（约 2 秒）
+# 固定标定四角（工作分辨率像素，顺序 左上/右上/右下/左下）：
+# 相机不动时用 a4_calib 量一次，把日志那行粘到这里；之后 pieces 直接用它，不再检测 A4。
+A4_QUAD_OVERRIDE = [(31, 8), (277, 30), (270, 190), (31, 198)]
 
-# ---- A4 区域锁定（a4_lock 模式）----
-A4_LOCK_THRESHOLDS = [[50, 100, -60, 60, -60, 60]]
-A4_BLOB_MIN_PIXELS = 500
-A4_LOCK_MIN_AREA_RATIO = 0.08
-A4_LOCK_RATIO_MIN, A4_LOCK_RATIO_MAX = 0.4, 2.0
-CONFIRM_FRAMES = 8               # 连续多少帧结果一致才锁定
-CENTER_TOL_PX = 20
-SIZE_TOL_RATIO = 0.15
+# ---- 碎片识别参数（工作分辨率像素）----
+PIECE_THRESHOLDS = [[30, 100, -128, 127, -128, 127]]   # 碎片颜色（LAB），下限跟现场实测一致
+PIECE_INVERT = False             # True：碎片比背景暗
+PIECE_MIN_PIXELS = 200           # 小于此像素数不算碎片
+PIECE_MAX_PIXELS = 20000         # 大于此像素数多半是底板或背景
+MIN_EDGE_MM = 10.0               # 短于此长度的边判为假边并合并（题目要求现场碎片边 ≥20mm）
+PIECE_COLORS = [image.COLOR_RED, image.COLOR_GREEN, image.COLOR_BLUE,
+                image.COLOR_YELLOW, image.COLOR_PURPLE, image.COLOR_ORANGE]
 
 # ---- 运行开关 ----
 VERBOSE = True                   # True：每秒打印运行状态，便于现场调试
 STATUS_REPORT_SEC = 1.0
-ANALYZE_INTERVAL_SEC = 0.5       # 重算间隔：中间帧复用上次结果，重活不必每帧做
-FULL_FRAME_WARN_RATIO = 0.85     # 实时框占比超过此值时告警，提示曝光或阈值异常
+ANALYZE_INTERVAL_SEC = 0.8       # 重算间隔：中间帧复用上次结果，重活不必每帧做
 
 
 def open_uart():
@@ -176,7 +174,7 @@ def find_a4_quad(work):
 
 
 def mm_corners_for(quad):
-    """按四角在画面里的长宽比判断 A4 是横放还是竖放，返回对应的毫米四角坐标。
+    """按四角在画面里的长宽比判断 A4 横放还是竖放，返回 (毫米四角, 方向名)。
 
     横竖弄反会让标定尺寸差 297/210 ≈ 1.41 倍，参考线就会一长一短。
     返回顺序与 quad 一致：左上 / 右上 / 右下 / 左下。
@@ -231,10 +229,7 @@ def smooth_quad(old, new, alpha):
 
 def run_a4_calib(cam, disp):
     """A4 四角标定：画四角与参考线；红线用尺子量，应正好 REFERENCE_MM 毫米。
-
-    两个省算力的做法：重算每 ANALYZE_INTERVAL_SEC 才做一次，中间帧复用上次结果；
-    四角做时序平滑，单帧抖动不画出来，连续多帧偏离才认为纸张被移动。
-    """
+    重算每 ANALYZE_INTERVAL_SEC 一次，中间帧复用；四角时序平滑，连续多帧偏离才认移动。"""
     frames = 0
     t_begin = time.time()
     locked = None
@@ -279,84 +274,102 @@ def run_a4_calib(cam, disp):
                                   for px, py in locked)
                 print("fps %.1f | 纸张方向=%s | A4 四角(原图,左上起顺时针): %s | 红线应正好 %.0fmm" %
                       (frames / (now - t_begin), orientation, coords, REFERENCE_MM))
+                print("   固定标定用（工作分辨率，可直接粘到 main.py）: A4_QUAD_OVERRIDE = [%s]" %
+                      ", ".join("(%d, %d)" % (int(px), int(py)) for px, py in locked))
             frames = 0
             t_begin = now
 
 
-def find_best_a4_box(img):
-    """返回画面中最像 A4 的候选框 (x, y, w, h)，没有合格候选时返回 None。"""
-    blobs = img.find_blobs(A4_LOCK_THRESHOLDS, pixels_threshold=A4_BLOB_MIN_PIXELS)
-    frame_area = CAM_W * CAM_H
-    best = None
-    best_area = 0
-    for blob in blobs:
-        x, y, w, h = blob[0], blob[1], blob[2], blob[3]
-        if h <= 0:
-            continue
-        ratio = w / h
-        if ratio < A4_LOCK_RATIO_MIN or ratio > A4_LOCK_RATIO_MAX:
-            continue
-        area = w * h
-        if area < frame_area * A4_LOCK_MIN_AREA_RATIO:
-            continue
-        if area > best_area:
-            best_area = area
-            best = (x, y, w, h)
-    return best
+def a4_roi(quad, margin=6):
+    """由 A4 四角算出包围盒，作为碎片搜索的 ROI，能省不少算力。"""
+    xs = [point[0] for point in quad]
+    ys = [point[1] for point in quad]
+    x0 = max(0, int(min(xs)) - margin)
+    y0 = max(0, int(min(ys)) - margin)
+    x1 = min(WORK_W, int(max(xs)) + margin)
+    y1 = min(WORK_H, int(max(ys)) + margin)
+    return [x0, y0, x1 - x0, y1 - y0]
 
 
-def is_same_target(a, b):
-    """判断两个框是否可视为同一目标：中心偏移和尺寸变化都在容差内。"""
-    if a is None or b is None:
-        return False
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    if abs((ax + aw / 2) - (bx + bw / 2)) > CENTER_TOL_PX:
-        return False
-    if abs((ay + ah / 2) - (by + bh / 2)) > CENTER_TOL_PX:
-        return False
-    if abs(aw - bw) > aw * SIZE_TOL_RATIO:
-        return False
-    if abs(ah - bh) > ah * SIZE_TOL_RATIO:
-        return False
-    return True
+def scale_px_per_mm(quad, mm_corners):
+    """由 A4 的像素边长与毫米边长估算"每毫米多少像素"（缩小图分辨率）。"""
+    px_len = math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1])
+    mm_len = math.hypot(mm_corners[1][0] - mm_corners[0][0],
+                        mm_corners[1][1] - mm_corners[0][1])
+    if mm_len <= 1e-6:
+        return 1.0
+    return px_len / mm_len
 
 
-def run_a4_lock(cam, disp):
-    """A4 区域锁定：连续多帧一致后锁绿框，作为后续识别的 ROI。"""
-    state = "calib"
-    stable = 0
-    last = None
-    locked = None
+def run_pieces(cam, disp):
+    """碎片识别模式：先用四角标定，再把碎片顶点换算成毫米并打印每片位姿。
+    标定只在开机做一次（纸与相机不动）；碎片识别按 ANALYZE_INTERVAL_SEC 降频。"""
     frames = 0
     t_begin = time.time()
+    quad = None
+    px_to_mm = None
+    min_edge_px = 0.0
+    last_analyze = 0.0
+    shapes = []
+    lines = []
     while not app.need_exit():
         img = cam.read()
-        live = find_best_a4_box(img)
+        work = build_work_image(img)
+        now = time.time()
 
-        if state == "calib":
-            stable = stable + 1 if is_same_target(last, live) else (1 if live else 0)
-            last = live
-            if stable >= CONFIRM_FRAMES:
-                locked = live
-                state = "run"
-                print("A4 locked: x=%d y=%d w=%d h=%d" % locked)
+        if quad is None:
+            if A4_QUAD_OVERRIDE:     # 用固定四角，不再依赖 A4 能不能被检出
+                quad = [(float(px), float(py)) for px, py in A4_QUAD_OVERRIDE]
+            else:
+                quad = find_a4_quad(work)
+            if quad is not None:
+                mm_corners, orientation = mm_corners_for(quad)
+                px_to_mm = vision_geo.compute_homography(quad, mm_corners)
+                min_edge_px = MIN_EDGE_MM * scale_px_per_mm(quad, mm_corners)
+                print("A4 标定完成：方向=%s 四角=%s | 每毫米 %.3f 像素，假边阈值 %.1f 像素" %
+                      (orientation, quad, scale_px_per_mm(quad, mm_corners), min_edge_px))
+        elif now - last_analyze >= ANALYZE_INTERVAL_SEC:
+            last_analyze = now
+            shapes = vision_pieces.find_piece_shapes(work, img, WORK_SCALE, WORK_W, WORK_H,
+                                                     a4_roi(quad), min_edge_px)
+            lines = [vision_pieces.format_piece_mm(
+                index, [vision_geo.apply_homography(px_to_mm, x, y) for x, y in shape["verts"]])
+                     for index, shape in enumerate(shapes)]
 
-        if live is not None:
-            img.draw_rect(live[0], live[1], live[2], live[3], image.COLOR_RED)
-        if locked is not None:
-            img.draw_rect(locked[0], locked[1], locked[2], locked[3], image.COLOR_GREEN)
+        if quad is not None:     # A4 外框用灰色细线画，表示毫米坐标系范围
+            pixels = [(px * WORK_SCALE, py * WORK_SCALE) for px, py in quad]
+            for i in range(4):
+                x1, y1 = pixels[i]
+                x2, y2 = pixels[(i + 1) % 4]
+                img.draw_line(int(x1), int(y1), int(x2), int(y2), image.COLOR_GRAY)
+        for index, shape in enumerate(shapes):
+            color = PIECE_COLORS[index % len(PIECE_COLORS)]
+            verts = shape["verts"]
+            count = len(verts)
+            for i in range(count):
+                x1, y1 = verts[i]
+                x2, y2 = verts[(i + 1) % count]
+                img.draw_line(int(x1 * WORK_SCALE), int(y1 * WORK_SCALE),
+                              int(x2 * WORK_SCALE), int(y2 * WORK_SCALE), color)
+            cx, cy = int(shape["center"][0] * WORK_SCALE), int(shape["center"][1] * WORK_SCALE)
+            img.draw_cross(cx, cy, color, 6)
+            img.draw_string(cx + 8, cy + 8, str(index), color, scale=1)
         disp.show(img)
 
         frames += 1
-        now = time.time()
         if now - t_begin >= STATUS_REPORT_SEC:
-            share = 0.0 if live is None else (live[2] * live[3]) / float(CAM_W * CAM_H)
-            if VERBOSE:
-                print("fps %.1f | state=%s stable=%d | locked=%s | live=%s (%.0f%%)" % (
-                    frames / (now - t_begin), state, stable, locked, live, share * 100))
-            elif share >= FULL_FRAME_WARN_RATIO:
-                print("WARN 整幅画面都是亮区，检查曝光与阈值")
+            if quad is None:
+                print("fps %.1f | 等待 A4 标定：放好 A4，或把 a4_calib 打印的那行填进 A4_QUAD_OVERRIDE" %
+                      (frames / (now - t_begin)))
+            else:
+                print("fps %.1f | pieces=%d" % (frames / (now - t_begin), len(shapes)))
+                for text in lines:
+                    print("   " + text)
+                if not shapes:
+                    count, biggest = vision_pieces.probe(work, a4_roi(quad))
+                    print("   未检出：阈值内候选=%d 最大=%dpx（判据 %d~%dpx）"
+                          "｜候选=0 查阈值/光照，候选>0 查尺寸判据"
+                          % (count, biggest, PIECE_MIN_PIXELS, PIECE_MAX_PIXELS))
             frames = 0
             t_begin = now
 
@@ -369,13 +382,16 @@ def main():
     if serial is not None:
         serial.write_str("ready\r\n")   # 下位机收到这行说明物理链路已通
 
+    vision_pieces.configure(THRESHOLDS=PIECE_THRESHOLDS, INVERT=PIECE_INVERT,
+                            MIN_PIXELS=PIECE_MIN_PIXELS, MAX_PIXELS=PIECE_MAX_PIXELS)
+
     exposure, gain = setup_camera(cam)
     print("camera set: exposure=%s us, gain=%s | RUN_MODE=%s" % (exposure, gain, RUN_MODE))
 
     if RUN_MODE == "a4_calib":
         run_a4_calib(cam, disp)
-    elif RUN_MODE == "a4_lock":
-        run_a4_lock(cam, disp)
+    elif RUN_MODE == "pieces":
+        run_pieces(cam, disp)
     else:
         print("未知 RUN_MODE:", RUN_MODE)
 
