@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>拼图搬运可视化</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a21; --line:#2a2f3a; --text:#e6e9ef; --muted:#98a1b0;
+    --c0:#ff5d5d; --c1:#4ade80; --c2:#60a5fa; --c3:#fbbf24; --c4:#c084fc; --c5:#fb923c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:18px;display:grid;gap:14px;
+        grid-template-columns:minmax(0,2.1fr) minmax(280px,1fr)}
+  @media (max-width:860px){.wrap{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  h1{margin:0 0 4px;font-size:17px;font-weight:500}
+  h2{margin:14px 0 6px;font-size:13px;font-weight:500;color:var(--muted)}
+  p.hint{margin:0 0 10px;color:var(--muted);font-size:12px}
+  svg{display:block;width:100%;height:auto;background:#0b0d12;border-radius:8px}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:10px}
+  button{background:#232936;color:var(--text);border:1px solid var(--line);border-radius:7px;
+         padding:7px 13px;font-size:13px}
+  button:hover{background:#2b3241}
+  input[type=range]{flex:1;min-width:150px}
+  textarea{width:100%;height:110px;background:#0b0d12;color:var(--text);border:1px solid var(--line);
+           border-radius:7px;padding:8px;font:12px/1.5 ui-monospace,Consolas,monospace;resize:vertical}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:right;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--muted);font-weight:500}
+  .swatch{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px}
+  .state{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="panel">
+    <h1>拼图搬运可视化</h1>
+    <p class="hint">实线＝当前碎片位置，虚线＝拼图目标位置，细线＝搬运轨迹；拖动进度条或点播放查看过程。</p>
+    <svg id="stage" viewBox="0 0 297 210" role="img"
+         aria-label="A4 台面上的碎片初始位置、搬运轨迹与拼图目标位置"></svg>
+    <div class="row">
+      <button id="play" type="button">播放</button>
+      <button id="reset" type="button">复位</button>
+      <input id="progress" type="range" min="0" max="4" step="0.01" value="0" aria-label="搬运进度">
+      <span class="state" id="state">进度 0 / 4</span>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <h2>碎片数据</h2>
+    <table>
+      <thead><tr><th>碎片</th><th>顶点</th><th>面积 mm²</th><th>旋转 °</th><th>位移 mm</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <h2>载入摄像头数据</h2>
+    <p class="hint">把视觉端打印的 JSON 行粘进来；assembly=solved 是真实拼接解，preview 是求解失败时的搬运预览。</p>
+    <textarea id="json" spellcheck="false"
+      placeholder='{"a4":[297,210],"pieces":[{"id":0,"verts":[[80,40],[140,40],[140,90],[80,90]]}]}'></textarea>
+    <div class="row">
+      <button id="load" type="button">载入</button>
+      <button id="demo" type="button">用演示数据</button>
+      <span class="state" id="msg"></span>
+    </div>
+  </aside>
+</div>
+
+<script>
+const COLORS = ["--c0","--c1","--c2","--c3","--c4","--c5"];
+const svg = document.getElementById("stage");
+const rowsEl = document.getElementById("rows");
+const msgEl = document.getElementById("msg");
+const stateEl = document.getElementById("state");
+const slider = document.getElementById("progress");
+
+let data = null;          // {a4:[w,h], pieces:[{id, verts, target?, rotate?}]}
+let progress = 0;         // 已完成搬运的碎片数（可含小数）
+let playing = false;
+let timer = null;
+
+function centroid(verts) {
+  let a = 0, cx = 0, cy = 0;
+  for (let i = 0; i < verts.length; i++) {
+    const [x1, y1] = verts[i], [x2, y2] = verts[(i + 1) % verts.length];
+    const cross = x1 * y2 - x2 * y1;
+    a += cross; cx += (x1 + x2) * cross; cy += (y1 + y2) * cross;
+  }
+  if (Math.abs(a) < 1e-6) return [verts[0][0], verts[0][1]];
+  return [cx / (3 * a), cy / (3 * a)];
+}
+
+function area(verts) {
+  let a = 0;
+  for (let i = 0; i < verts.length; i++) {
+    const [x1, y1] = verts[i], [x2, y2] = verts[(i + 1) % verts.length];
+    a += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(a) / 2;
+}
+
+function rotate(p, cx, cy, deg) {
+  const r = deg * Math.PI / 180, s = Math.sin(r), c = Math.cos(r);
+  const dx = p[0] - cx, dy = p[1] - cy;
+  return [cx + dx * c - dy * s, cy + dx * s + dy * c];
+}
+
+// 把碎片从当前位置搬到目标位置：位置线性插值，同时绕自身质心旋转 rotate*frac 度
+function poseAt(piece, frac) {
+  if (!piece.target) return piece.verts;
+  const s = centroid(piece.verts), t = centroid(piece.target);
+  const x = s[0] + (t[0] - s[0]) * frac, y = s[1] + (t[1] - s[1]) * frac;
+  const deg = (piece.rotate || 0) * frac;
+  return piece.verts.map(p => {
+    const q = rotate(p, s[0], s[1], deg);
+    return [q[0] + (x - s[0]), q[1] + (y - s[1])];
+  });
+}
+
+function el(name, attrs) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const key in attrs) node.setAttribute(key, attrs[key]);
+  return node;
+}
+
+function colorOf(i) { return getComputedStyle(document.documentElement).getPropertyValue(COLORS[i % COLORS.length]); }
+
+function render() {
+  svg.innerHTML = "";
+  if (!data) return;
+  const [w, h] = data.a4;
+  svg.setAttribute("viewBox", `-6 -6 ${w + 12} ${h + 12}`);
+
+  svg.appendChild(el("rect", { x: 0, y: 0, width: w, height: h, fill: "#12151c", stroke: "#3b4252", "stroke-width": 1 }));
+  for (let x = 10; x < w; x += 10) svg.appendChild(el("line", { x1: x, y1: 0, x2: x, y2: h, stroke: "#1d222c", "stroke-width": 0.15 }));
+  for (let y = 10; y < h; y += 10) svg.appendChild(el("line", { x1: 0, y1: y, x2: w, y2: y, stroke: "#1d222c", "stroke-width": 0.15 }));
+
+  data.pieces.forEach((piece, i) => {
+    const color = colorOf(i);
+    const start = centroid(piece.verts);
+    // 搬运轨迹：从起点质心到目标质心
+    if (piece.target) {
+      const end = centroid(piece.target);
+      svg.appendChild(el("line", { x1: start[0], y1: start[1], x2: end[0], y2: end[1],
+        stroke: color, "stroke-width": 0.7, "stroke-dasharray": "2 2", opacity: 0.75 }));
+      svg.appendChild(el("circle", { cx: end[0], cy: end[1], r: 1.1, fill: color, opacity: 0.9 }));
+      svg.appendChild(el("polygon", { points: piece.target.map(p => p.join(",")).join(" "),
+        fill: "none", stroke: color, "stroke-width": 0.5, "stroke-dasharray": "1.6 1.6", opacity: 0.55 }));
+    }
+    const frac = Math.max(0, Math.min(1, progress - i));
+    const poly = poseAt(piece, frac);
+    const center = centroid(poly);
+    svg.appendChild(el("polygon", { points: poly.map(p => p.join(",")).join(" "),
+      fill: color, "fill-opacity": 0.22, stroke: color, "stroke-width": 0.8 }));
+    svg.appendChild(el("circle", { cx: center[0], cy: center[1], r: 1.2, fill: color }));
+    const label = el("text", { x: center[0] + 2.4, y: center[1] - 1.6, fill: color,
+      "font-size": 6, "font-weight": 500 });
+    label.textContent = piece.id;
+    svg.appendChild(label);
+  });
+
+  const done = data.pieces.filter((p, i) => progress - i >= 1).length;
+  stateEl.textContent = `进度 ${done} / ${data.pieces.length}`;
+}
+
+function renderTable() {
+  rowsEl.innerHTML = "";
+  data.pieces.forEach((piece, i) => {
+    const s = centroid(piece.verts);
+    const t = piece.target ? centroid(piece.target) : null;
+    const move = t ? Math.hypot(t[0] - s[0], t[1] - s[1]) : NaN;
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td><span class="swatch" style="background:${colorOf(i)}"></span>#${piece.id}</td>` +
+      `<td>${piece.verts.length}</td><td>${area(piece.verts).toFixed(0)}</td>` +
+      `<td>${piece.rotate === undefined ? "-" : piece.rotate.toFixed(1)}</td>` +
+      `<td>${isNaN(move) ? "-" : move.toFixed(1)}</td>`;
+    rowsEl.appendChild(tr);
+  });
+}
+
+function setData(next) {
+  data = next;
+  slider.max = String(data.pieces.length);
+  progress = 0;
+  slider.value = "0";
+  stop();
+  renderTable();
+  render();
+  const mode = data.assembly === "solved" ? "拼接已求解"
+             : data.assembly === "preview" ? "拼接预览（求解失败）"
+             : "仅初始位置";
+  msgEl.textContent = `已载入 ${data.pieces.length} 片 · ${mode}`;
+}
+
+function stop() { playing = false; document.getElementById("play").textContent = "播放"; if (timer) { clearInterval(timer); timer = null; } }
+
+document.getElementById("play").addEventListener("click", () => {
+  if (playing) { stop(); return; }
+  if (progress >= data.pieces.length) progress = 0;
+  playing = true;
+  document.getElementById("play").textContent = "暂停";
+  timer = setInterval(() => {
+    progress = Math.min(data.pieces.length, progress + 0.06);
+    slider.value = String(progress);
+    render();
+    if (progress >= data.pieces.length) stop();
+  }, 40);
+});
+document.getElementById("reset").addEventListener("click", () => {
+  stop(); progress = 0; slider.value = "0"; render();
+});
+slider.addEventListener("input", () => { stop(); progress = parseFloat(slider.value); render(); });
+document.getElementById("demo").addEventListener("click", () => setData(buildDemo()));
+document.getElementById("load").addEventListener("click", () => {
+  // 允许直接粘日志整行：去掉开头的 "JSON " 前缀与多余空白
+  const raw = document.getElementById("json").value.trim().replace(/^JSON\s+/i, "");
+  try {
+    setData(JSON.parse(raw));
+  } catch (err) {
+    msgEl.textContent = "JSON 解析失败：" + err.message;
+  }
+});
+
+// 演示数据：把 120×90 的矩形用直线切成 4 片，散放在上半区，目标在下半区
+function buildDemo() {
+  const B = [40, 0], T = [120, 0], E = [120, 90], L = [0, 90];
+  const J = [66.6, 29.9], K = [86.8, 52.6], C = [0, 45], D = [0, 70];
+  const shapes = [
+    [[0, 0], B, J, C], [[0, 45], D, K, J], [[0, 70], K, E, L], [B, T, E],
+  ];
+  const scatter = [[70, 20, 12], [150, 35, -25], [200, 15, 40], [225, 60, -60]];
+  const origin = [80, 105];
+  const pieces = shapes.map((shape, i) => {
+    const local = centroid(shape);
+    const target = shape.map(p => [p[0] + origin[0] - 60, p[1] + origin[1] - 45]);
+    const angle = scatter[i][2];
+    const start = shape.map(p => {
+      const r = rotate([p[0] - 60, p[1] - 45], 0, 0, angle);
+      return [r[0] + scatter[i][0], r[1] + scatter[i][1]];
+    });
+    return { id: i, verts: start, target: target, rotate: -angle };
+  });
+  return { a4: [297, 210], pieces: pieces };
+}
+
+setData(buildDemo());
+</script>
+</body>
+</html>

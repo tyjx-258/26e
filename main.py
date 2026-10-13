@@ -1,11 +1,4 @@
-# main.py - MaixCAM Pro 视觉端主程序（唯一入口）
-#
-# MaixVision 只能"运行完整项目"，所以各流程都收在这里，用 RUN_MODE 切换：
-#   "a4_calib" - A4 四角标定：检出四角算 像素<->毫米 单应矩阵，并画 100mm 参考线核对
-#   "pieces"   - 碎片识别：用四角标定把碎片顶点换算成毫米，打印每片位姿
-# 运行：MaixVision 打开本工程文件夹 -> 运行完整项目。
-# 依赖：vision_geo.py（纯几何）、vision_pieces.py（碎片识别）；曝光标定见 calib_exposure.py。
-# 硬件假设：MaixCAM / MaixCAM Pro 本体；未接下位机时保持 USE_UART = False。
+# main.py - MaixCAM Pro 视觉端主程序；RUN_MODE 切换 a4_calib / pieces。
 
 import math
 import time
@@ -14,6 +7,7 @@ from maix import app, camera, display, image, pinmap, uart, err
 
 import vision_geo
 import vision_pieces
+import vision_assemble
 
 # ---- 运行模式 ----
 RUN_MODE = "pieces"              # "a4_calib" | "pieces"
@@ -56,12 +50,11 @@ REFERENCE_MM = 100.0             # 参考线长度（毫米），用尺子核对
 QUAD_SMOOTH_ALPHA = 0.25         # 四角时序平滑系数：越小越稳、越大跟得越快
 QUAD_TOL_PX = 12                 # 与锁定四角的平均偏差超过它就认为纸张在动
 QUAD_SWITCH_FRAMES = 4           # 连续多少次重算都偏离才切换锁定四角（约 2 秒）
-# 固定标定四角（工作分辨率像素，顺序 左上/右上/右下/左下）：
-# 相机不动时用 a4_calib 量一次，把日志那行粘到这里；之后 pieces 直接用它，不再检测 A4。
-A4_QUAD_OVERRIDE = [(31, 8), (277, 30), (270, 190), (31, 198)]
+# 龙门架未固定前留空：每次启动自动检测 A4；固定后把 a4_calib 输出的四角粘到这里。
+A4_QUAD_OVERRIDE = []
 
 # ---- 碎片识别参数（工作分辨率像素）----
-PIECE_THRESHOLDS = [[30, 100, -128, 127, -128, 127]]   # 碎片颜色（LAB），下限跟现场实测一致
+PIECE_THRESHOLDS = [[20, 100, -30, 30, -30, 30]]       # 白片：放宽亮度、收紧色度，保住阴影边
 PIECE_INVERT = False             # True：碎片比背景暗
 PIECE_MIN_PIXELS = 200           # 小于此像素数不算碎片
 PIECE_MAX_PIXELS = 20000         # 大于此像素数多半是底板或背景
@@ -73,6 +66,9 @@ PIECE_COLORS = [image.COLOR_RED, image.COLOR_GREEN, image.COLOR_BLUE,
 VERBOSE = True                   # True：每秒打印运行状态，便于现场调试
 STATUS_REPORT_SEC = 1.0
 ANALYZE_INTERVAL_SEC = 0.8       # 重算间隔：中间帧复用上次结果，重活不必每帧做
+ASSEMBLE_ENABLED = False         # 板端先关真实求解；确认帧率后可改 True
+ASSEMBLE_RETRY_SEC = 3.0         # 拼图求解很重：失败后隔几秒再试，避免拖垮帧率
+EXPORT_JSON = True               # True：每秒额外打印一行 JSON，可粘进 viz_assembly.html
 
 
 def open_uart():
@@ -133,11 +129,7 @@ def build_work_image(img):
 
 
 def find_a4_quad(work):
-    """在缩小图上找 A4 纸张，返回四个角（工作分辨率坐标，顺序 左上/右上/右下/左下）。
-
-    A4 是画面里最大的亮块（白纸放深色垫上）；深色 A4 放浅色垫上时把 A4_INVERT 置 True。
-    四角用 轮廓 -> 凸包 -> 简化 -> 顶点合并 得到，恰好 4 个才认，否则返回 None。
-    """
+    """找 A4 四角（工作分辨率，左上/右上/右下/左下）；A4 是画面里最大的亮块。"""
     mask_img = work.binary(A4_CALIB_THRESHOLDS, invert=A4_INVERT, copy=True)
     if A4_CLOSE_SIZE > 0:        # 闭运算：补上被阴影吃掉的边缘断口，四角更稳
         mask_img = mask_img.dilate(A4_CLOSE_SIZE).erode(A4_CLOSE_SIZE)
@@ -174,11 +166,7 @@ def find_a4_quad(work):
 
 
 def mm_corners_for(quad):
-    """按四角在画面里的长宽比判断 A4 横放还是竖放，返回 (毫米四角, 方向名)。
-
-    横竖弄反会让标定尺寸差 297/210 ≈ 1.41 倍，参考线就会一长一短。
-    返回顺序与 quad 一致：左上 / 右上 / 右下 / 左下。
-    """
+    """按长宽比判断 A4 横竖，返回 (毫米四角, 方向名)；横竖反了尺寸会差约 1.41 倍。"""
     (x0, y0), (x1, y1), _, (x3, y3) = quad
     width = math.hypot(x1 - x0, y1 - y0)
     height = math.hypot(x3 - x0, y3 - y0)
@@ -190,10 +178,7 @@ def mm_corners_for(quad):
 
 
 def draw_calibration(img, quad, mm_corners, mm_to_px):
-    """画 A4 四边与角点序号，再在纸张中心画水平、垂直两条 REFERENCE_MM 毫米参考线。
-
-    mm_to_px 由调用方预先算好：单应矩阵解算较重，不必每帧重算。
-    """
+    """画 A4 四边、角点序号与两条 REFERENCE_MM 毫米参考线；mm_to_px 由调用方缓存。"""
     pixels = [(px * WORK_SCALE, py * WORK_SCALE) for px, py in quad]
     for i in range(4):
         x1, y1 = pixels[i]
@@ -228,8 +213,7 @@ def smooth_quad(old, new, alpha):
 
 
 def run_a4_calib(cam, disp):
-    """A4 四角标定：画四角与参考线；红线用尺子量，应正好 REFERENCE_MM 毫米。
-    重算每 ANALYZE_INTERVAL_SEC 一次，中间帧复用；四角时序平滑，连续多帧偏离才认移动。"""
+    """A4 四角标定：红线应正好 REFERENCE_MM 毫米；降频重算并做四角时序平滑。"""
     frames = 0
     t_begin = time.time()
     locked = None
@@ -302,16 +286,20 @@ def scale_px_per_mm(quad, mm_corners):
 
 
 def run_pieces(cam, disp):
-    """碎片识别模式：先用四角标定，再把碎片顶点换算成毫米并打印每片位姿。
-    标定只在开机做一次（纸与相机不动）；碎片识别按 ANALYZE_INTERVAL_SEC 降频。"""
+    """碎片识别模式：四角标定一次，碎片识别降频并输出页面用的 JSON。"""
     frames = 0
     t_begin = time.time()
     quad = None
     px_to_mm = None
+    mm_corners = None
     min_edge_px = 0.0
     last_analyze = 0.0
+    last_solve = 0.0
+    last_count = -1
     shapes = []
     lines = []
+    targets = None
+    assembly = "none"
     while not app.need_exit():
         img = cam.read()
         work = build_work_image(img)
@@ -320,18 +308,28 @@ def run_pieces(cam, disp):
         if quad is None:
             if A4_QUAD_OVERRIDE:     # 用固定四角，不再依赖 A4 能不能被检出
                 quad = [(float(px), float(py)) for px, py in A4_QUAD_OVERRIDE]
-            else:
-                quad = find_a4_quad(work)
+            elif now - last_analyze >= ANALYZE_INTERVAL_SEC:
+                last_analyze = now; quad = find_a4_quad(work)
             if quad is not None:
                 mm_corners, orientation = mm_corners_for(quad)
                 px_to_mm = vision_geo.compute_homography(quad, mm_corners)
                 min_edge_px = MIN_EDGE_MM * scale_px_per_mm(quad, mm_corners)
-                print("A4 标定完成：方向=%s 四角=%s | 每毫米 %.3f 像素，假边阈值 %.1f 像素" %
+                print("A4 标定完成，可拿走 A4 后放碎片：方向=%s 四角=%s | 每毫米 %.3f 像素，假边阈值 %.1f 像素" %
                       (orientation, quad, scale_px_per_mm(quad, mm_corners), min_edge_px))
         elif now - last_analyze >= ANALYZE_INTERVAL_SEC:
             last_analyze = now
             shapes = vision_pieces.find_piece_shapes(work, img, WORK_SCALE, WORK_W, WORK_H,
                                                      a4_roi(quad), min_edge_px)
+            if len(shapes) != last_count:
+                targets, assembly, last_solve = None, "none", 0.0
+                last_count = len(shapes)
+            a4_mm = (mm_corners[1][0], mm_corners[2][1])
+            if shapes and ASSEMBLE_ENABLED and len(shapes) == 4 and targets is None and now - last_solve >= ASSEMBLE_RETRY_SEC:
+                targets, assembly = vision_assemble.layout_for_shapes(shapes, px_to_mm, a4_mm)
+                last_solve = now
+            elif shapes and not ASSEMBLE_ENABLED:
+                targets = vision_assemble.preview_for_shapes(shapes, px_to_mm, a4_mm)
+                assembly = "preview"
             lines = [vision_pieces.format_piece_mm(
                 index, [vision_geo.apply_homography(px_to_mm, x, y) for x, y in shape["verts"]])
                      for index, shape in enumerate(shapes)]
@@ -365,6 +363,10 @@ def run_pieces(cam, disp):
                 print("fps %.1f | pieces=%d" % (frames / (now - t_begin), len(shapes)))
                 for text in lines:
                     print("   " + text)
+                if EXPORT_JSON and shapes and mm_corners is not None:
+                    print("JSON " + vision_pieces.pieces_json(
+                        (mm_corners[1][0], mm_corners[2][1]), px_to_mm, shapes,
+                        targets, assembly))
                 if not shapes:
                     count, biggest = vision_pieces.probe(work, a4_roi(quad))
                     print("   未检出：阈值内候选=%d 最大=%dpx（判据 %d~%dpx）"
@@ -372,7 +374,6 @@ def run_pieces(cam, disp):
                           % (count, biggest, PIECE_MIN_PIXELS, PIECE_MAX_PIXELS))
             frames = 0
             t_begin = now
-
 
 def main():
     cam = camera.Camera(CAM_W, CAM_H)

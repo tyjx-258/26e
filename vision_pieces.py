@@ -22,14 +22,14 @@ from maix import image
 import vision_geo
 
 # ---- 可调参数（除特别说明外，单位都是"缩小图"像素）----
-THRESHOLDS = [[40, 100, -128, 127, -128, 127]]          # 碎片颜色（LAB）
+THRESHOLDS = [[20, 100, -30, 30, -30, 30]]              # 碎片颜色（LAB）
 INVERT = False                                           # True：碎片比背景暗
 PATCH_THRESHOLDS = [[50, 100, -128, 127, -128, 127]]     # 二值块上再取连通区的阈值
 MIN_PIXELS = 200                                         # 小于此像素数不算碎片
 MAX_PIXELS = 20000                                       # 大于此像素数多半是底板或背景
 BBOX_PAD = 3                                             # 裁剪时包围盒外扩
 CLOSE_SIZE = 0                                           # >0 闭运算补内部空洞（牌面图案用）
-OPEN_SIZE = 3                                            # >0 开运算切断碎片之间的细连接
+OPEN_SIZE = 0                                            # 开运算会削掉尖角，白片场景先关闭
 EPSILON_RATIO = 0.01                                     # 简化阈值 = 周长 × 该比例
 MIN_EPSILON = 2.0
 MAX_EPSILON = 4.0
@@ -115,6 +115,16 @@ def find_piece_shapes(work, full, scale, width, height, roi=None, min_edge=0.0):
         if OPEN_SIZE > 0:
             fine_mask = fine_mask.erode(OPEN_SIZE * scale).dilate(OPEN_SIZE * scale)
 
+        # 裁切框可能同时包含邻片；只选离种子最近的连通块，不改变掩膜形态。
+        fine_seed_x = int(blob.cx() * scale - fx0)
+        fine_seed_y = int(blob.cy() * scale - fy0)
+        fine_sub = pick_component(fine_mask, fine_seed_x, fine_seed_y)
+        if fine_sub is None or fine_sub[2] < 5 or fine_sub[3] < 5:
+            continue
+        fine_mask = fine_mask.crop(fine_sub[0], fine_sub[1], fine_sub[2], fine_sub[3])
+        fx0 += fine_sub[0]
+        fy0 += fine_sub[1]
+
         local = image.image2cv(fine_mask)[:, :, 0] > 128
         contour = vision_geo.scan_contour(local)
         if len(contour) < 8:
@@ -168,3 +178,27 @@ def format_piece_mm(index, verts_mm):
     return "#%d v=%d 边长[%s] 质心=(%.1f,%.1f) 角度=%.1f 面积=%.0fmm2" % (
         index, count, ",".join("%.1f" % e for e in edges),
         center[0], center[1], angle, area)
+
+
+def pieces_json(a4_mm, px_to_mm, shapes, targets=None, assembly="none"):
+    """把识别结果打包成可视化页面（viz_assembly.html）能直接读的一行 JSON。
+
+    a4_mm 是 A4 的毫米尺寸 (宽, 高)，px_to_mm 是标定得到的单应矩阵。
+    targets 是 {id: {target, rotate}}；没有求解结果时页面只画初始位置。
+    输出的 verts 已经是毫米坐标、A4 左上角为原点，页面可以直接画。
+    """
+    targets = targets or {}
+    items = []
+    for index, shape in enumerate(shapes):
+        verts = [vision_geo.apply_homography(px_to_mm, x, y) for x, y in shape["verts"]]
+        text = ",".join("[%.1f,%.1f]" % (px, py) for px, py in verts)
+        item = '{"id":%d,"verts":[%s]' % (index, text)
+        target = targets.get(index)
+        if target:
+            target_text = ",".join("[%.1f,%.1f]" % (px, py)
+                                   for px, py in target["target"])
+            item += ',"target":[%s],"rotate":%.1f' % (target_text, target["rotate"])
+        item += "}"
+        items.append(item)
+    return '{"a4":[%g,%g],"assembly":"%s","pieces":[%s]}' % (
+        a4_mm[0], a4_mm[1], assembly, ",".join(items))
