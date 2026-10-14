@@ -20,6 +20,18 @@ MAX_SOLUTIONS = 1         # 找到一个满铺矩形就够搬运；继续找多�
 CONTACT_RATIO = 0.5       # 真实相邻边至少覆盖较短边的一半；用于砍掉“只碰角”的伪候选
 MIN_CONTACT_MM = 1.0
 
+# 模板拼接：以下 verts 是正确拼好后的目标位置，单位为毫米。
+TEMPLATE = {
+    "a4": [297, 210],
+    "pieces": [
+        {"id": 0, "verts": [[54.9, 68.1], [97.4, 70.1], [95.0, 122.4]]},
+        {"id": 1, "verts": [[37.2, 69.0], [51.5, 68.5], [63.1, 83.9], [35.5, 135.1]]},
+        {"id": 2, "verts": [[37.9, 142.2], [62.3, 89.9], [92.9, 126.3]]},
+        {"id": 3, "verts": [[38.0, 146.8], [95.2, 129.7], [96.5, 165.7], [39.4, 166.7]]},
+    ],
+}
+AUTO_SOLVE_ENABLED = False  # 模板优先；自动搜索默认关闭，避免板端阻塞主循环
+
 
 def _edges(verts):
     """返回 [(长度, 起点, 终点), ...]。"""
@@ -103,6 +115,8 @@ def _candidate_placements(placed_polys, local):
                     for anchor, target in ((rq1, (px1, py1)), (rq1, (px2, py2)),
                                            (rq2, (px1, py1)), (rq2, (px2, py2))):
                         verts = _translate(rotated, target[0] - anchor[0], target[1] - anchor[1])
+                        if contact < max(MIN_CONTACT_MM, min_edge * CONTACT_RATIO):
+                            continue
                         key = tuple((round(x, 1), round(y, 1)) for x, y in verts)
                         if key in seen:
                             continue
@@ -267,6 +281,106 @@ def solve_for_shapes(shapes, px_to_mm, a4_mm):
     return {item["id"]: item for item in result}
 
 
+def _shape_signature(verts):
+    """返回旋转/平移无关的形状签名：顶点数、面积、归一化边长。"""
+    _, area = vision_geo.polygon_centroid(verts)
+    edges = sorted(edge[0] for edge in _edges(verts))
+    scale = math.sqrt(area) if area > 1e-6 else 1.0
+    return len(verts), area, [edge / scale for edge in edges]
+
+
+def _signature_score(a, b):
+    """比较两个形状签名，越小越像。"""
+    if abs(a[0] - b[0]) > 1:
+        return 1e9
+    area_score = abs(a[1] - b[1]) / max(a[1], b[1], 1.0)
+    count_score = abs(a[0] - b[0]) * 0.5
+    if len(a[2]) == len(b[2]):
+        edge_score = sum(abs(x - y) for x, y in zip(a[2], b[2])) / max(len(a[2]), 1)
+    else:
+        edge_score = abs(sum(a[2]) - sum(b[2])) / max(sum(a[2]), sum(b[2]), 1.0)
+    return area_score + count_score + edge_score
+
+
+def _point_segment_distance(point, start, end):
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _chamfer_score(poly_a, poly_b):
+    """双向倒角距离：两边互相到对方最近边的距离之和，越小形状越贴近。"""
+    edges_b = _edges(poly_b)
+    edges_a = _edges(poly_a)
+    total = 0.0
+    for point in poly_a:
+        total += min(_point_segment_distance(point, edge[1], edge[2]) for edge in edges_b)
+    for point in poly_b:
+        total += min(_point_segment_distance(point, edge[1], edge[2]) for edge in edges_a)
+    return total / max(len(poly_a) + len(poly_b), 1)
+
+
+def _best_rotation(current, target):
+    """枚举边配对，用倒角距离选最优旋转角，避免最长边 180° 歧义。"""
+    current_center = vision_geo.polygon_centroid(current)[0]
+    target_center = vision_geo.polygon_centroid(target)[0]
+    cur = [(x - current_center[0], y - current_center[1]) for x, y in current]
+    dst = [(x - target_center[0], y - target_center[1]) for x, y in target]
+    best_score = None
+    best_angle = 0.0
+    for current_edge in _edges(cur):
+        current_angle = math.degrees(math.atan2(
+            current_edge[2][1] - current_edge[1][1],
+            current_edge[2][0] - current_edge[1][0]))
+        for target_edge in _edges(dst):
+            target_angle = math.degrees(math.atan2(
+                target_edge[2][1] - target_edge[1][1],
+                target_edge[2][0] - target_edge[1][0]))
+            for flip in (0.0, 180.0):
+                angle = target_angle - current_angle + flip
+                rotated = _rotate(cur, angle)
+                score = _chamfer_score(rotated, dst)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_angle = angle
+    return _normalize_angle(best_angle)
+
+
+def template_layout_for_shapes(shapes, px_to_mm, a4_mm):
+    """用 TEMPLATE 匹配当前 3~4 片，命中时返回 {当前序号: {target, rotate}}。"""
+    if not TEMPLATE or not TEMPLATE.get("pieces") or len(TEMPLATE["pieces"]) != len(shapes):
+        return None
+    current = []
+    for shape in shapes:
+        verts = [vision_geo.apply_homography(px_to_mm, x, y) for x, y in shape["verts"]]
+        current.append((verts, _shape_signature(verts)))
+    used = set()
+    result = {}
+    for index, (verts, signature) in enumerate(current):
+        best = None
+        for item in TEMPLATE["pieces"]:
+            tid = item["id"]
+            if tid in used:
+                continue
+            target = [tuple(point) for point in item["verts"]]
+            score = _signature_score(signature, _shape_signature(target))
+            if best is None or score < best[0]:
+                best = (score, tid, target)
+        if best is None:
+            return None
+        _, tid, target = best
+        used.add(tid)
+        rotate = _best_rotation(verts, target)
+        result[index] = {"id": index, "target": target, "rotate": rotate}
+    return result
+
+
 def preview_for_shapes(shapes, px_to_mm, a4_mm, gap_mm=8.0):
     """求解失败时的可视化降级：把各片平移到 A4 下半区排成一行，仅用于画搬运轨迹。
 
@@ -300,7 +414,12 @@ def preview_for_shapes(shapes, px_to_mm, a4_mm, gap_mm=8.0):
 
 
 def layout_for_shapes(shapes, px_to_mm, a4_mm):
-    """返回 (目标字典, 状态)。状态为 "solved" 或 "preview"。"""
+    """返回 (目标字典, 状态)。状态为 "template"、"solved" 或 "preview"。"""
+    template = template_layout_for_shapes(shapes, px_to_mm, a4_mm)
+    if template:
+        return template, "template"
+    if not AUTO_SOLVE_ENABLED:
+        return preview_for_shapes(shapes, px_to_mm, a4_mm), "preview"
     try:
         solved = solve_for_shapes(shapes, px_to_mm, a4_mm)
     except Exception as e:

@@ -17,6 +17,8 @@
 
 import math
 
+import numpy as np
+
 from maix import image
 
 import vision_geo
@@ -57,7 +59,7 @@ def build_mask(img):
 
 
 def pick_component(patch, seed_x, seed_y):
-    """在局部二值块上再取一次连通区，剔掉框进来的邻片，返回离种子最近的 Blob。"""
+    """用 MaixPy find_blobs 快速选离种子最近的连通块，返回 Blob bbox。"""
     blobs = patch.find_blobs(PATCH_THRESHOLDS, pixels_threshold=MIN_PIXELS, merge=False)
     best = None
     best_distance = 0.0
@@ -68,6 +70,46 @@ def pick_component(patch, seed_x, seed_y):
         if best is None or distance < best_distance:
             best, best_distance = blob, distance
     return best
+
+
+def component_mask(mask, seed_x, seed_y):
+    """从种子点做局部 4 邻域生长，返回只包含当前碎片的布尔掩膜。"""
+    height, width = mask.shape
+    seed_x = min(max(int(seed_x), 0), width - 1)
+    seed_y = min(max(int(seed_y), 0), height - 1)
+    if not mask[seed_y, seed_x]:
+        found = None
+        for radius in range(1, 4):
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    x, y = seed_x + dx, seed_y + dy
+                    if 0 <= x < width and 0 <= y < height and mask[y, x]:
+                        found = (x, y)
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if found is None:
+            return None
+        seed_x, seed_y = found
+
+    visited = np.zeros_like(mask, dtype=bool)
+    stack = [(seed_x, seed_y)]
+    while stack:
+        x, y = stack.pop()
+        if visited[y, x] or not mask[y, x]:
+            continue
+        visited[y, x] = True
+        if x > 0:
+            stack.append((x - 1, y))
+        if x + 1 < width:
+            stack.append((x + 1, y))
+        if y > 0:
+            stack.append((x, y - 1))
+        if y + 1 < height:
+            stack.append((x, y + 1))
+    return visited
 
 
 def find_piece_shapes(work, full, scale, width, height, roi=None, min_edge=0.0):
@@ -86,6 +128,8 @@ def find_piece_shapes(work, full, scale, width, height, roi=None, min_edge=0.0):
             continue        # 太大，多半是把底板或背景当成了一片
 
         x, y, w, h = blob[0], blob[1], blob[2], blob[3]
+        if w * h > MAX_PIXELS * 2:
+            continue        # 先挡掉超大 bbox，避免后续 BFS/裁切把主循环拖死
         x0 = max(0, x - BBOX_PAD)
         y0 = max(0, y - BBOX_PAD)
         x1 = min(width, x + w + BBOX_PAD)
@@ -115,7 +159,7 @@ def find_piece_shapes(work, full, scale, width, height, roi=None, min_edge=0.0):
         if OPEN_SIZE > 0:
             fine_mask = fine_mask.erode(OPEN_SIZE * scale).dilate(OPEN_SIZE * scale)
 
-        # 裁切框可能同时包含邻片；只选离种子最近的连通块，不改变掩膜形态。
+        # 裁切框可能同时包含邻片；用种子点做连通域隔离，避免按行扫描把两片拼成一条轮廓。
         fine_seed_x = int(blob.cx() * scale - fx0)
         fine_seed_y = int(blob.cy() * scale - fy0)
         fine_sub = pick_component(fine_mask, fine_seed_x, fine_seed_y)
@@ -124,8 +168,24 @@ def find_piece_shapes(work, full, scale, width, height, roi=None, min_edge=0.0):
         fine_mask = fine_mask.crop(fine_sub[0], fine_sub[1], fine_sub[2], fine_sub[3])
         fx0 += fine_sub[0]
         fy0 += fine_sub[1]
-
+        fine_seed_x = int(blob.cx() * scale - fx0)
+        fine_seed_y = int(blob.cy() * scale - fy0)
         local = image.image2cv(fine_mask)[:, :, 0] > 128
+        if local.size > 40000:
+            continue        # 细裁切仍过大：多为背景，直接跳过避免 BFS 卡顿
+        isolated = component_mask(local, fine_seed_x, fine_seed_y)
+        if isolated is None:
+            continue
+        rows = np.flatnonzero(isolated.any(axis=1))
+        cols = np.flatnonzero(isolated.any(axis=0))
+        if len(rows) < 5 or len(cols) < 5:
+            continue
+        y0i, y1i = int(rows[0]), int(rows[-1])
+        x0i, x1i = int(cols[0]), int(cols[-1])
+        local = isolated[y0i:y1i + 1, x0i:x1i + 1]
+        fx0 += x0i
+        fy0 += y0i
+
         contour = vision_geo.scan_contour(local)
         if len(contour) < 8:
             continue
@@ -147,6 +207,8 @@ def find_piece_shapes(work, full, scale, width, height, roi=None, min_edge=0.0):
         verts = [(px / scale, py / scale) for px, py in verts]   # 回到缩小图分辨率
 
         center, area = vision_geo.polygon_centroid(verts)
+        if area > MAX_PIXELS:
+            continue        # 轮廓面积超限：多为白色标定纸/桌边，不是碎片
         angle, _, _, _ = vision_geo.longest_edge(verts)
         shapes.append({"verts": verts, "center": center, "angle": angle, "area": area})
     return shapes

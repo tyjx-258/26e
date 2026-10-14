@@ -26,7 +26,7 @@ GAIN_VALUE = 500
 WORK_SCALE = 2               # 识别在 1/2 分辨率上进行：像素数降到 1/4，坐标最后乘回来
 
 # ---- 分割（阈值与像素数按原分辨率描述，代码里按 WORK_SCALE 折算）----
-PIECE_INVERT = False         # True：目标比背景暗（浅底 + 深色碎片）
+PIECE_INVERT = False       # True：目标比背景暗（浅底 + 深色碎片）
 PIECE_THRESHOLDS = [[20, 100, -30, 30, -30, 30]]       # LAB：白片放宽亮度，收紧色度
 MIN_PIXELS = 800             # 碎片最小像素数
 MAX_PIXELS = 80000           # 碎片最大像素数：挡掉把底板/背景当成一片的情况

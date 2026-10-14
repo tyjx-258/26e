@@ -36,10 +36,10 @@ WORK_H = CAM_H // WORK_SCALE
 # ---- A4 四角标定 ----
 A4_MM_SHORT = 210.0              # A4 短边（毫米）
 A4_MM_LONG = 297.0               # A4 长边（毫米）
-A4_INVERT = False                # True：A4 比背景暗（深色 A4 + 浅色垫子）
-A4_CALIB_THRESHOLDS = [[55, 100, -128, 127, -128, 127]]
-A4_MIN_AREA_RATIO = 0.15         # A4 至少要占画面这么大比例，用来与碎片区分
-A4_CALIB_MIN_PIXELS = 2000       # 工作分辨率下的最小像素数（兜底）
+A4_INVERT = False                # 标定纸为白色 A4：找画面里的高亮大块
+A4_CALIB_THRESHOLDS = [[25, 100, -60, 60, -60, 60], [40, 100, -128, 127, -128, 127]]
+A4_MIN_AREA_RATIO = 0.08         # 重新标定时允许 A4 在画面里小一些
+A4_CALIB_MIN_PIXELS = 1000       # 工作分辨率下的最小像素数（兜底）
 A4_BBOX_PAD = 3
 A4_CLOSE_SIZE = 3                # 对 A4 掩膜做闭运算，补上被阴影吃掉的边缘断口
 EPSILON_RATIO = 0.01             # 简化阈值 = 轮廓周长 × 该比例
@@ -50,14 +50,14 @@ REFERENCE_MM = 100.0             # 参考线长度（毫米），用尺子核对
 QUAD_SMOOTH_ALPHA = 0.25         # 四角时序平滑系数：越小越稳、越大跟得越快
 QUAD_TOL_PX = 12                 # 与锁定四角的平均偏差超过它就认为纸张在动
 QUAD_SWITCH_FRAMES = 4           # 连续多少次重算都偏离才切换锁定四角（约 2 秒）
-# 龙门架未固定前留空：每次启动自动检测 A4；固定后把 a4_calib 输出的四角粘到这里。
-A4_QUAD_OVERRIDE = []
+# 白色 A4 标定结果（工作分辨率像素：左上/右上/右下/左下）
+A4_QUAD_OVERRIDE = [(35, 26), (301, 7), (299, 194), (42, 205)]
 
 # ---- 碎片识别参数（工作分辨率像素）----
-PIECE_THRESHOLDS = [[20, 100, -30, 30, -30, 30]]       # 白片：放宽亮度、收紧色度，保住阴影边
+PIECE_THRESHOLDS = [[30, 100, -25, 25, -15, 25]]       # 白片：亮且偏中性，避开深蓝卡纸
 PIECE_INVERT = False             # True：碎片比背景暗
 PIECE_MIN_PIXELS = 200           # 小于此像素数不算碎片
-PIECE_MAX_PIXELS = 20000         # 大于此像素数多半是底板或背景
+PIECE_MAX_PIXELS = 8000          # 大于此像素数多半是底板或背景
 MIN_EDGE_MM = 10.0               # 短于此长度的边判为假边并合并（题目要求现场碎片边 ≥20mm）
 PIECE_COLORS = [image.COLOR_RED, image.COLOR_GREEN, image.COLOR_BLUE,
                 image.COLOR_YELLOW, image.COLOR_PURPLE, image.COLOR_ORANGE]
@@ -65,8 +65,8 @@ PIECE_COLORS = [image.COLOR_RED, image.COLOR_GREEN, image.COLOR_BLUE,
 # ---- 运行开关 ----
 VERBOSE = True                   # True：每秒打印运行状态，便于现场调试
 STATUS_REPORT_SEC = 1.0
-ANALYZE_INTERVAL_SEC = 0.8       # 重算间隔：中间帧复用上次结果，重活不必每帧做
-ASSEMBLE_ENABLED = False         # 板端先关真实求解；确认帧率后可改 True
+ANALYZE_INTERVAL_SEC = 1.2       # 重算间隔：中间帧复用上次结果，重活不必每帧做
+ASSEMBLE_ENABLED = True          # True：3~4 片时先查模板；未命中才走 preview
 ASSEMBLE_RETRY_SEC = 3.0         # 拼图求解很重：失败后隔几秒再试，避免拖垮帧率
 EXPORT_JSON = True               # True：每秒额外打印一行 JSON，可粘进 viz_assembly.html
 
@@ -324,7 +324,7 @@ def run_pieces(cam, disp):
                 targets, assembly, last_solve = None, "none", 0.0
                 last_count = len(shapes)
             a4_mm = (mm_corners[1][0], mm_corners[2][1])
-            if shapes and ASSEMBLE_ENABLED and len(shapes) == 4 and targets is None and now - last_solve >= ASSEMBLE_RETRY_SEC:
+            if shapes and 3 <= len(shapes) <= 4 and ASSEMBLE_ENABLED and targets is None and now - last_solve >= ASSEMBLE_RETRY_SEC:
                 targets, assembly = vision_assemble.layout_for_shapes(shapes, px_to_mm, a4_mm)
                 last_solve = now
             elif shapes and not ASSEMBLE_ENABLED:

@@ -189,7 +189,8 @@ function setData(next) {
   stop();
   renderTable();
   render();
-  const mode = data.assembly === "solved" ? "拼接已求解"
+  const mode = data.assembly === "template" ? "模板拼接命中"
+             : data.assembly === "solved" ? "拼接已求解"
              : data.assembly === "preview" ? "拼接预览（求解失败）"
              : "仅初始位置";
   msgEl.textContent = `已载入 ${data.pieces.length} 片 · ${mode}`;
