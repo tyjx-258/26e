@@ -248,3 +248,16 @@ def apply_homography(matrix, x, y):
         return (x, y)
     return ((matrix[0][0] * x + matrix[0][1] * y + matrix[0][2]) / denominator,
             (matrix[1][0] * x + matrix[1][1] * y + matrix[1][2]) / denominator)
+
+
+def polygon_inside_rect(px_to_mm, points, mm_corners, margin=3.0):
+    """判断像素多边形是否完整落在 A4 毫米矩形内（margin 允许少量边界误差）。"""
+    xs = [point[0] for point in mm_corners]
+    ys = [point[1] for point in mm_corners]
+    min_x, max_x = min(xs) - margin, max(xs) + margin
+    min_y, max_y = min(ys) - margin, max(ys) + margin
+    for x, y in points:
+        u, v = apply_homography(px_to_mm, x, y)
+        if not (min_x <= u <= max_x and min_y <= v <= max_y):
+            return False
+    return True

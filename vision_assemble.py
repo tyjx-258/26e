@@ -12,13 +12,20 @@
 #   5. 找到第一个满铺矩形就返回，并把它摆到 A4 下半区；不追多解，避免板端超时。
 
 import math
+import time
 
 import vision_geo
 
-MAX_STEPS = 200000        # 兜底：板端不能因为搜索失控卡死
+MAX_STEPS = 30000         # 兜底：板端不能因为搜索失控卡死
 MAX_SOLUTIONS = 1         # 找到一个满铺矩形就够搬运；继续找多解会明显拖慢板端
-CONTACT_RATIO = 0.5       # 真实相邻边至少覆盖较短边的一半；用于砍掉“只碰角”的伪候选
+CONTACT_RATIO = 0.35      # 真实相邻边至少覆盖较短边的一部分；兼顾 T 型接缝
 MIN_CONTACT_MM = 1.0
+AUTO_SOLVE_MAX_SEC = 2.0  # 自动搜索时间上限，避免阻塞摄像头主循环
+SOLVE_MIN_EDGE_MM = 15.0  # 求解前清理短于该值的假边（题目真实边>=20mm）
+SLIDE_STEP_MM = 2.0       # T 型接缝：沿贴合边滑动的候选步长
+AUTO_BEAM_WIDTH = 8       # 自动搜索每层保留的候选数
+AUTO_MAX_CANDIDATES = 80  # 每个状态的候选上限，防止搜索爆炸
+EDGE_LENGTH_RATIO_MIN = 0.2  # 两条边长度比小于该值时不考虑贴合（借鉴 puzzle-bot 的边长筛选）
 
 # 模板拼接：以下 verts 是正确拼好后的目标位置，单位为毫米。
 TEMPLATE = {
@@ -30,7 +37,7 @@ TEMPLATE = {
         {"id": 3, "verts": [[38.0, 146.8], [95.2, 129.7], [96.5, 165.7], [39.4, 166.7]]},
     ],
 }
-AUTO_SOLVE_ENABLED = False  # 模板优先；自动搜索默认关闭，避免板端阻塞主循环
+AUTO_SOLVE_ENABLED = True   # 模板未命中时启用有限时间的自动几何求解
 
 
 def _edges(verts):
@@ -108,6 +115,8 @@ def _candidate_placements(placed_polys, local):
                     rq1 = _rotate([(qx1, qy1)], theta)[0]
                     rq2 = _rotate([(qx2, qy2)], theta)[0]
                     span_b = sorted((rq1[0] * ux + rq1[1] * uy, rq2[0] * ux + rq2[1] * uy))
+                    if min(ulen, local_edge[0]) / max(ulen, local_edge[0]) < EDGE_LENGTH_RATIO_MIN:
+                        continue
                     contact = min(span_a[1], span_b[1]) - max(span_a[0], span_b[0])
                     min_edge = min(ulen, local_edge[0])
                     if contact < max(MIN_CONTACT_MM, min_edge * CONTACT_RATIO):
@@ -123,6 +132,56 @@ def _candidate_placements(placed_polys, local):
                         seen.add(key)
                         out.append((verts, theta))
     return out
+
+
+def _slide_candidates(placed_polys, local):
+    """T 型接缝候选：允许待放边沿已放边滑动，返回 [(顶点, 旋转角, 接触长度)]。"""
+    local_edges = _edges(local)
+    seen = set()
+    out = []
+    for placed in placed_polys:
+        for edge in _edges(placed):
+            (px1, py1), (px2, py2) = edge[1], edge[2]
+            base = math.degrees(math.atan2(py2 - py1, px2 - px1))
+            ux, uy = px2 - px1, py2 - py1
+            ulen = math.hypot(ux, uy)
+            if ulen < 1e-9:
+                continue
+            ux, uy = ux / ulen, uy / ulen
+            span_a = sorted((px1 * ux + py1 * uy, px2 * ux + py2 * uy))
+            for local_edge in local_edges:
+                (qx1, qy1), (qx2, qy2) = local_edge[1], local_edge[2]
+                here = math.degrees(math.atan2(qy2 - qy1, qx2 - qx1))
+                for flip in (0.0, 180.0):
+                    theta = base - here + flip
+                    rotated = _rotate(local, theta)
+                    rq1 = _rotate([(qx1, qy1)], theta)[0]
+                    rq2 = _rotate([(qx2, qy2)], theta)[0]
+                    length = local_edge[0]
+                    if min(ulen, length) / max(ulen, length) < EDGE_LENGTH_RATIO_MIN:
+                        continue
+                    offsets = (-length, 0.0, ulen - length, ulen)
+                    start = -length
+                    while start <= ulen + 1e-9:
+                        offsets += (start,)
+                        start += SLIDE_STEP_MM
+                    for offset in offsets:
+                        target = (px1 + ux * offset, py1 + uy * offset)
+                        verts = _translate(rotated, target[0] - rq1[0], target[1] - rq1[1])
+                        moved_q2 = (rq2[0] + target[0] - rq1[0],
+                                    rq2[1] + target[1] - rq1[1])
+                        span_b = sorted((target[0] * ux + target[1] * uy,
+                                         moved_q2[0] * ux + moved_q2[1] * uy))
+                        contact = min(span_a[1], span_b[1]) - max(span_a[0], span_b[0])
+                        if contact < max(MIN_CONTACT_MM, min(length, ulen) * CONTACT_RATIO):
+                            continue
+                        key = tuple((round(x, 1), round(y, 1)) for x, y in verts)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append((verts, theta, contact))
+    out.sort(key=lambda item: item[2], reverse=True)
+    return out[:AUTO_MAX_CANDIDATES]
 
 
 def _rectangle_score(polys, angle_tol=0.08, area_tol=0.03):
@@ -172,10 +231,14 @@ def _has_axis_edge(verts, axis_deg, tol_deg=6.0):
     return False
 
 
-def solve(pieces, a4_mm=(297.0, 210.0)):
+def solve(pieces, a4_mm=(297.0, 210.0), time_limit=None):
     """求解拼图：pieces 为 [{"id", "verts"}]（毫米），返回 [{id, target, rotate}] 或 None。"""
     if not pieces:
         return None
+    start_time = time.time()
+    total_limit = AUTO_SOLVE_MAX_SEC if time_limit is None else time_limit
+    final_deadline = start_time + total_limit
+    deadline = start_time + total_limit * 0.5
 
     local_shapes = []
     for piece in pieces:
@@ -190,9 +253,9 @@ def solve(pieces, a4_mm=(297.0, 210.0)):
     solutions = []
     steps = [0]
 
-    def search(placed, remaining, axis):
+    def search(placed, remaining, axis, use_slide=False):
         steps[0] += 1
-        if steps[0] > MAX_STEPS or len(solutions) >= MAX_SOLUTIONS:
+        if steps[0] > MAX_STEPS or len(solutions) >= MAX_SOLUTIONS or time.time() > deadline:
             return
         placed_polys = [item["verts"] for item in placed]
         if not remaining:
@@ -202,7 +265,10 @@ def solve(pieces, a4_mm=(297.0, 210.0)):
             return
         for index in [i for i in order if i in remaining]:
             local = local_shapes[index]["local"]
-            for verts, theta in _candidate_placements(placed_polys, local):
+            candidates = (_slide_candidates(placed_polys, local) if use_slide
+                          else _candidate_placements(placed_polys, local))
+            for candidate in candidates:
+                verts, theta = candidate[0], candidate[1]
                 if not _has_axis_edge(verts, axis):
                     continue
                 if any(polygons_overlap(verts, other) for other in placed_polys):
@@ -212,7 +278,7 @@ def solve(pieces, a4_mm=(297.0, 210.0)):
                     continue
                 placed.append({"id": index, "verts": verts, "rotate": theta})
                 remaining.discard(index)
-                search(placed, remaining, axis)
+                search(placed, remaining, axis, use_slide)
                 remaining.add(index)
                 placed.pop()
                 if steps[0] > MAX_STEPS or len(solutions) >= MAX_SOLUTIONS:
@@ -225,7 +291,11 @@ def solve(pieces, a4_mm=(297.0, 210.0)):
         axis = math.degrees(math.atan2(seed_edge[2][1] - seed_edge[1][1],
                                        seed_edge[2][0] - seed_edge[1][0]))
         search([{"id": seed, "verts": seed_local, "rotate": 0.0}],
-               set(range(len(local_shapes))) - {seed}, axis)
+               set(range(len(local_shapes))) - {seed}, axis, False)
+        deadline = final_deadline
+        if not solutions and time.time() < deadline:
+            search([{"id": seed, "verts": seed_local, "rotate": 0.0}],
+                   set(range(len(local_shapes))) - {seed}, axis, True)
         if len(solutions) >= MAX_SOLUTIONS or steps[0] > MAX_STEPS:
             break
     if not solutions:
@@ -274,6 +344,7 @@ def solve_for_shapes(shapes, px_to_mm, a4_mm):
     pieces = []
     for index, shape in enumerate(shapes):
         verts = [vision_geo.apply_homography(px_to_mm, x, y) for x, y in shape["verts"]]
+        verts = vision_geo.merge_short_edges(verts, SOLVE_MIN_EDGE_MM)
         pieces.append({"id": index, "verts": verts})
     result = solve(pieces, a4_mm)
     if not result:
@@ -413,11 +484,13 @@ def preview_for_shapes(shapes, px_to_mm, a4_mm, gap_mm=8.0):
     return result
 
 
-def layout_for_shapes(shapes, px_to_mm, a4_mm):
+def layout_for_shapes(shapes, px_to_mm, a4_mm, mode="template"):
     """返回 (目标字典, 状态)。状态为 "template"、"solved" 或 "preview"。"""
-    template = template_layout_for_shapes(shapes, px_to_mm, a4_mm)
-    if template:
-        return template, "template"
+    if mode == "template":
+        template = template_layout_for_shapes(shapes, px_to_mm, a4_mm)
+        if template:
+            return template, "template"
+        return preview_for_shapes(shapes, px_to_mm, a4_mm), "preview"
     if not AUTO_SOLVE_ENABLED:
         return preview_for_shapes(shapes, px_to_mm, a4_mm), "preview"
     try:

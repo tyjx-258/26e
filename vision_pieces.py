@@ -24,9 +24,9 @@ from maix import image
 import vision_geo
 
 # ---- 可调参数（除特别说明外，单位都是"缩小图"像素）----
-THRESHOLDS = [[20, 100, -30, 30, -30, 30]]              # 碎片颜色（LAB）
+THRESHOLDS = [[35, 100, -25, 25, -12, 10]]               # 碎片颜色（LAB）
 INVERT = False                                           # True：碎片比背景暗
-PATCH_THRESHOLDS = [[50, 100, -128, 127, -128, 127]]     # 二值块上再取连通区的阈值
+PATCH_THRESHOLDS = [[50, 100, -25, 25, -12, 10]]         # 二值块上再取连通区的阈值
 MIN_PIXELS = 200                                         # 小于此像素数不算碎片
 MAX_PIXELS = 20000                                       # 大于此像素数多半是底板或背景
 BBOX_PAD = 3                                             # 裁剪时包围盒外扩

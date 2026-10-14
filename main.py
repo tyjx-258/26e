@@ -5,15 +5,13 @@ import time
 
 from maix import app, camera, display, image, pinmap, uart, err
 
-import vision_geo
-import vision_pieces
-import vision_assemble
+import vision_geo, vision_pieces, vision_assemble, vision_mode, vision_stability
 
 # ---- 运行模式 ----
 RUN_MODE = "pieces"              # "a4_calib" | "pieces"
 
 # ---- 串口（对接下位机）----
-USE_UART = False                 # 未接 STM32 时保持 False；接上后改 True
+USE_UART = False                 # 暂未连接 STM32；接上后再改 True
 UART_DEV = "/dev/ttyS1"          # 不要用 /dev/ttyS0：它会输出启动日志，A16 被拉低还可能起不来
 UART_TX_PIN = "A19"
 UART_RX_PIN = "A18"
@@ -54,7 +52,7 @@ QUAD_SWITCH_FRAMES = 4           # 连续多少次重算都偏离才切换锁定
 A4_QUAD_OVERRIDE = [(35, 26), (301, 7), (299, 194), (42, 205)]
 
 # ---- 碎片识别参数（工作分辨率像素）----
-PIECE_THRESHOLDS = [[30, 100, -25, 25, -15, 25]]       # 白片：亮且偏中性，避开深蓝卡纸
+PIECE_THRESHOLDS = [[35, 100, -25, 25, -12, 10]]       # 白片：亮且偏中性，避开黄条纹
 PIECE_INVERT = False             # True：碎片比背景暗
 PIECE_MIN_PIXELS = 200           # 小于此像素数不算碎片
 PIECE_MAX_PIXELS = 8000          # 大于此像素数多半是底板或背景
@@ -285,7 +283,7 @@ def scale_px_per_mm(quad, mm_corners):
     return px_len / mm_len
 
 
-def run_pieces(cam, disp):
+def run_pieces(cam, disp, serial=None):
     """碎片识别模式：四角标定一次，碎片识别降频并输出页面用的 JSON。"""
     frames = 0
     t_begin = time.time()
@@ -304,6 +302,7 @@ def run_pieces(cam, disp):
         img = cam.read()
         work = build_work_image(img)
         now = time.time()
+        vision_mode.poll(serial)
 
         if quad is None:
             if A4_QUAD_OVERRIDE:     # 用固定四角，不再依赖 A4 能不能被检出
@@ -320,12 +319,16 @@ def run_pieces(cam, disp):
             last_analyze = now
             shapes = vision_pieces.find_piece_shapes(work, img, WORK_SCALE, WORK_W, WORK_H,
                                                      a4_roi(quad), min_edge_px)
+            shapes = [shape for shape in shapes if vision_geo.polygon_inside_rect(
+                px_to_mm, shape["verts"], mm_corners)]
+            stable = vision_stability.update(shapes)
             if len(shapes) != last_count:
                 targets, assembly, last_solve = None, "none", 0.0
                 last_count = len(shapes)
             a4_mm = (mm_corners[1][0], mm_corners[2][1])
-            if shapes and 3 <= len(shapes) <= 4 and ASSEMBLE_ENABLED and targets is None and now - last_solve >= ASSEMBLE_RETRY_SEC:
-                targets, assembly = vision_assemble.layout_for_shapes(shapes, px_to_mm, a4_mm)
+            if stable and ASSEMBLE_ENABLED and targets is None and now - last_solve >= ASSEMBLE_RETRY_SEC:
+                targets, assembly = vision_assemble.layout_for_shapes(
+                    shapes, px_to_mm, a4_mm, vision_mode.get_mode())
                 last_solve = now
             elif shapes and not ASSEMBLE_ENABLED:
                 targets = vision_assemble.preview_for_shapes(shapes, px_to_mm, a4_mm)
@@ -378,21 +381,18 @@ def run_pieces(cam, disp):
 def main():
     cam = camera.Camera(CAM_W, CAM_H)
     disp = display.Display()
-
     serial = open_uart() if USE_UART else None
     if serial is not None:
         serial.write_str("ready\r\n")   # 下位机收到这行说明物理链路已通
 
     vision_pieces.configure(THRESHOLDS=PIECE_THRESHOLDS, INVERT=PIECE_INVERT,
                             MIN_PIXELS=PIECE_MIN_PIXELS, MAX_PIXELS=PIECE_MAX_PIXELS)
-
     exposure, gain = setup_camera(cam)
     print("camera set: exposure=%s us, gain=%s | RUN_MODE=%s" % (exposure, gain, RUN_MODE))
-
     if RUN_MODE == "a4_calib":
         run_a4_calib(cam, disp)
     elif RUN_MODE == "pieces":
-        run_pieces(cam, disp)
+        run_pieces(cam, disp, serial)
     else:
         print("未知 RUN_MODE:", RUN_MODE)
 
